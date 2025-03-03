@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 pragma solidity 0.8.10;
 
-import {LendingPool, LendingPoolFactory} from "src/LendingPoolFactory.sol";
+import {Fusion, Factory} from "src/Fusion.sol";
 
 // TODO: I should not have to import ERC20 from here.
 import {ERC20} from "solmate/utils/SafeTransferLib.sol";

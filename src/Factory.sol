@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 pragma solidity 0.8.10;
 
-import {LendingPool} from "./LendingPool.sol";
+import {Fusion} from "./Fusion.sol";
 import {PriceOracle} from "./interface/PriceOracle.sol";
 
 import {Auth, Authority} from "solmate/auth/Auth.sol";

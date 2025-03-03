@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 pragma solidity 0.8.10;
 
-import {LendingPool, LendingPoolFactory} from "src/LendingPoolFactory.sol";
+import {Fusion, Factory} from "src/Fusion.sol";
 
 import {MockPriceOracle} from "./mocks/MockPriceOracle.sol";
 import {PriceOracle} from "src/interface/PriceOracle.sol";

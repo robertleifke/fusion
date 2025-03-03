@@ -1,10 +1,10 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+
 pragma solidity 0.8.10;
 
-import {LendingPoolFactory} from "./LendingPoolFactory.sol";
+import {Factory} from "./Factory.sol";
 
 import {ERC20} from "solmate/tokens/ERC20.sol";
-import {ERC4626} from "solmate/mixins/ERC4626.sol";
+import {ERC4626} from "solmate/tokens/ERC4626.sol";
 import {Auth, Authority} from "solmate/auth/Auth.sol";
 
 import {PriceOracle} from "./interface/PriceOracle.sol";
@@ -15,25 +15,24 @@ import {SafeTransferLib} from "solmate/utils/SafeTransferLib.sol";
 import {SafeCastLib} from "solmate/utils/SafeCastLib.sol";
 import {FixedPointMathLib} from "solmate/utils/FixedPointMathLib.sol";
 
-/// @title Lending Pool
-/// @author Jet Jadeja <jet@pentagon.xyz>
-/// @notice Minimal, gas optimized lending pool contract
+/// @title Fusion
+/// @author Robert Leifke
+/// @co-author Jet Jadeja
+/// @notice Permissioned lending pool using Predicate
 contract LendingPool is Auth {
     using SafeTransferLib for ERC20;
     using SafeCastLib for uint256;
     using FixedPointMathLib for uint256;
 
-    /*///////////////////////////////////////////////////////////////
-                                IMMUTABLES
-    //////////////////////////////////////////////////////////////*/
-
-    /// @notice Pool name.
     string public name;
+    
+    mapping(address => bool) public isAuthorized;
+
 
     /// @notice Create a new Lending Pool.
-    /// @dev Retrieves the pool name from the LendingPoolFactory contract.
-    constructor() Auth(Auth(msg.sender).owner(), Auth(msg.sender).authority()) {
-        // Retrieve the name from the factory contract.
+    constructor(address _serviceManager,
+        string memory _policyID) Auth(Auth(msg.sender).owner(), Auth(msg.sender).authority()) {
+        _initPredicateClient(_serviceManager, policyID);
         name = LendingPoolFactory(msg.sender).poolDeploymentName();
     }
 
@@ -41,26 +40,18 @@ contract LendingPool is Auth {
                           ORACLE CONFIGURATION
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Address of the price oracle contract.
     PriceOracle public oracle;
 
-    /// @notice Emitted when the price oracle is changed.
-    /// @param user The authorized user who triggered the change.
-    /// @param newOracle The new price oracle address.
     event OracleUpdated(address indexed user, PriceOracle indexed newOracle);
 
-    /// @notice Sets a new oracle contract.
-    /// @param newOracle The address of the new oracle.
     function setOracle(PriceOracle newOracle) external requiresAuth {
-        // Update the oracle.
         oracle = newOracle;
 
-        // Emit the event.
         emit OracleUpdated(msg.sender, newOracle);
     }
 
     /*///////////////////////////////////////////////////////////////
-                          IRM CONFIGURATION
+                INTEREST RATE MODEL CONFIGURATION
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Maps ERC20 token addresses to their respective Interest Rate Model.
