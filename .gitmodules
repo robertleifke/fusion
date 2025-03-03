@@ -7,3 +7,6 @@
 [submodule "lib/solmate"]
 	path = lib/solmate
 	url = https://github.com/transmissions11/solmate
+[submodule "lib/predicate-contracts"]
+	path = lib/predicate-contracts
+	url = https://github.com/predicatelabs/predicate-contracts
