@@ -1,0 +1,10 @@
+{
+  "name": "@fusion/sdk",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Fusion TypeScript SDK (scaffold)",
+  "scripts": {
+    "build": "echo \"SDK scaffold only\"",
+    "test": "echo \"No tests yet\""
+  }
+}

@@ -1,0 +1,11 @@
+[workspace]
+members = [
+  "program",
+  "crates/fusion_state",
+]
+resolver = "2"
+
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1

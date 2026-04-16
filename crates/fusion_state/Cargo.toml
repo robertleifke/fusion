@@ -1,0 +1,12 @@
+[package]
+name = "fusion_state"
+version = "0.1.0"
+edition = "2021"
+description = "Shared Fusion state/types crate"
+
+[lib]
+name = "fusion_state"
+path = "src/lib.rs"
+
+[dependencies]
+solana-program = "2.3.0"
