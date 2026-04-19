@@ -1,0 +1,13 @@
+[package]
+name = "fusion_engine"
+version = "0.1.0"
+edition = "2021"
+description = "Shared Fusion orderbook primitives and instruction ABI"
+
+[dependencies]
+anchor-lang = "0.31.1"
+borsh = "0.10.4"
+solana-program = "2.2.1"
+
+[dev-dependencies]
+hex = "0.4"

@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "program",
+  "crates/fusion_engine",
   "crates/fusion_state",
 ]
 resolver = "2"

@@ -2,11 +2,10 @@ use anchor_lang::prelude::*;
 use anchor_spl::token_interface::{
     transfer_checked, Mint, TokenAccount, TokenInterface, TransferChecked,
 };
+use fusion_engine::{OrderNode, Side, MAX_ORDERS, NONE_INDEX};
 
 declare_id!("Fus1on1111111111111111111111111111111111111");
 
-const MAX_ORDERS: usize = 128;
-const NONE_INDEX: i16 = -1;
 const MARKET_SPACE: usize = 8 + 256 + (MAX_ORDERS * OrderNode::SIZE);
 
 #[program]
@@ -76,7 +75,7 @@ pub mod fusion {
         let mut quantity = quantity;
 
         let market = &mut ctx.accounts.market;
-        let side = Side::try_from(side)?;
+        let side = Side::try_from_u8(side).map_err(map_engine_error)?;
         let (expected_vault_authority, _) =
             Pubkey::find_program_address(&[b"vault_auth", market.key().as_ref()], ctx.program_id);
         require_keys_eq!(
@@ -343,20 +342,7 @@ pub mod fusion {
 
     pub fn cancel_order(ctx: Context<CancelOrderCtx>, order_id: u64) -> Result<()> {
         let market = &mut ctx.accounts.market;
-        let idx = market.find_order_index(order_id)?;
-        let snapshot = market.orders[to_usize(idx)?];
-        require_keys_eq!(
-            snapshot.owner,
-            ctx.accounts.owner.key(),
-            FusionError::Unauthorized
-        );
-        require!(snapshot.open, FusionError::OrderNotOpen);
-
-        if snapshot.in_book {
-            market.remove_from_book(idx)?;
-        }
-        market.order_mut(idx)?.open = false;
-        Ok(())
+        cancel_order_internal(market, ctx.accounts.owner.key(), order_id)
     }
 
     pub fn claim_order_proceeds(
@@ -365,32 +351,8 @@ pub mod fusion {
     ) -> Result<()> {
         let market = &mut ctx.accounts.market;
         let idx = market.find_order_index(order_id)?;
-        let (base_out, quote_out, should_close_slot) = {
-            let order = market.order_mut(idx)?;
-            require_keys_eq!(order.owner, ctx.accounts.owner.key(), FusionError::Unauthorized);
-
-            let base_out = order
-                .base_claimable
-                .checked_add(if order.open { 0 } else { order.locked_base })
-                .ok_or(error!(FusionError::MathOverflow))?;
-            let quote_out = order
-                .quote_claimable
-                .checked_add(if order.open { 0 } else { order.locked_quote })
-                .ok_or(error!(FusionError::MathOverflow))?;
-
-            order.base_claimable = 0;
-            order.quote_claimable = 0;
-            if !order.open {
-                order.locked_base = 0;
-                order.locked_quote = 0;
-            }
-
-            (
-                base_out,
-                quote_out,
-                !order.open && order.base_claimable == 0 && order.quote_claimable == 0,
-            )
-        };
+        let (base_out, quote_out, should_close_slot) =
+            claim_order_proceeds_internal(market, idx, ctx.accounts.owner.key())?;
 
         let (expected_vault_authority, _) =
             Pubkey::find_program_address(&[b"vault_auth", market.key().as_ref()], ctx.program_id);
@@ -445,6 +407,50 @@ pub mod fusion {
 
         Ok(())
     }
+}
+
+fn cancel_order_internal(market: &mut Market, owner: Pubkey, order_id: u64) -> Result<()> {
+    let idx = market.find_order_index(order_id)?;
+    let snapshot = market.orders[to_usize(idx)?];
+    require_keys_eq!(snapshot.owner, owner, FusionError::Unauthorized);
+    require!(snapshot.open, FusionError::OrderNotOpen);
+
+    if snapshot.in_book {
+        market.remove_from_book(idx)?;
+    }
+    market.order_mut(idx)?.open = false;
+    Ok(())
+}
+
+fn claim_order_proceeds_internal(
+    market: &mut Market,
+    idx: i16,
+    owner: Pubkey,
+) -> Result<(u64, u64, bool)> {
+    let order = market.order_mut(idx)?;
+    require_keys_eq!(order.owner, owner, FusionError::Unauthorized);
+
+    let base_out = order
+        .base_claimable
+        .checked_add(if order.open { 0 } else { order.locked_base })
+        .ok_or(error!(FusionError::MathOverflow))?;
+    let quote_out = order
+        .quote_claimable
+        .checked_add(if order.open { 0 } else { order.locked_quote })
+        .ok_or(error!(FusionError::MathOverflow))?;
+
+    order.base_claimable = 0;
+    order.quote_claimable = 0;
+    if !order.open {
+        order.locked_base = 0;
+        order.locked_quote = 0;
+    }
+
+    Ok((
+        base_out,
+        quote_out,
+        !order.open && order.base_claimable == 0 && order.quote_claimable == 0,
+    ))
 }
 
 #[derive(Accounts)]
@@ -635,7 +641,12 @@ impl Market {
     fn remove_from_book(&mut self, idx: i16) -> Result<()> {
         let (side, prev, next, in_book) = {
             let slot = self.order_mut(idx)?;
-            (slot.side_enum()?, slot.prev, slot.next, slot.in_book)
+            (
+                slot.side_enum().map_err(map_engine_error)?,
+                slot.prev,
+                slot.next,
+                slot.in_book,
+            )
         };
         require!(in_book, FusionError::OrderNotOpen);
 
@@ -658,7 +669,11 @@ impl Market {
     fn insert_into_book(&mut self, idx: i16) -> Result<()> {
         let (side, price, id) = {
             let slot = self.order_mut(idx)?;
-            (slot.side_enum()?, slot.price, slot.id)
+            (
+                slot.side_enum().map_err(map_engine_error)?,
+                slot.price,
+                slot.id,
+            )
         };
 
         let mut current = self.best_head(side);
@@ -697,81 +712,6 @@ impl Market {
     }
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
-#[repr(u8)]
-pub enum Side {
-    Bid = 0,
-    Ask = 1,
-}
-
-impl Side {
-    fn opposite(&self) -> Side {
-        match self {
-            Side::Bid => Side::Ask,
-            Side::Ask => Side::Bid,
-        }
-    }
-
-    fn try_from(v: u8) -> Result<Side> {
-        match v {
-            0 => Ok(Side::Bid),
-            1 => Ok(Side::Ask),
-            _ => err!(FusionError::InvalidSide),
-        }
-    }
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
-pub struct OrderNode {
-    pub used: bool,
-    pub open: bool,
-    pub in_book: bool,
-    pub side: u8,
-    pub next: i16,
-    pub prev: i16,
-    pub id: u64,
-    pub owner: Pubkey,
-    pub price: u64,
-    pub qty: u64,
-    pub locked_base: u64,
-    pub locked_quote: u64,
-    pub base_claimable: u64,
-    pub quote_claimable: u64,
-}
-
-impl Default for OrderNode {
-    fn default() -> Self {
-        Self {
-            used: false,
-            open: false,
-            in_book: false,
-            side: Side::Bid as u8,
-            next: NONE_INDEX,
-            prev: NONE_INDEX,
-            id: 0,
-            owner: Pubkey::default(),
-            price: 0,
-            qty: 0,
-            locked_base: 0,
-            locked_quote: 0,
-            base_claimable: 0,
-            quote_claimable: 0,
-        }
-    }
-}
-
-impl OrderNode {
-    const SIZE: usize = 96;
-
-    fn is_live(&self) -> bool {
-        self.used && self.open && self.in_book && self.qty > 0
-    }
-
-    fn side_enum(&self) -> Result<Side> {
-        Side::try_from(self.side)
-    }
-}
-
 fn to_usize(idx: i16) -> Result<usize> {
     require!(idx >= 0, FusionError::IndexOutOfBounds);
     let u = idx as usize;
@@ -801,4 +741,250 @@ pub enum FusionError {
     InvalidPda,
     #[msg("Index out of bounds")]
     IndexOutOfBounds,
+}
+
+fn map_engine_error(err: fusion_engine::FusionEngineError) -> Error {
+    match err {
+        fusion_engine::FusionEngineError::InvalidSide => error!(FusionError::InvalidSide),
+        fusion_engine::FusionEngineError::InvalidInstructionTag
+        | fusion_engine::FusionEngineError::InvalidInstructionData => {
+            error!(FusionError::InvalidSide)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_test_market() -> Market {
+        let mut market = Market {
+            admin: Pubkey::new_unique(),
+            base_mint: Pubkey::new_unique(),
+            quote_mint: Pubkey::new_unique(),
+            base_vault: Pubkey::new_unique(),
+            quote_vault: Pubkey::new_unique(),
+            bump: 1,
+            vault_authority_bump: 255,
+            bids_head: NONE_INDEX,
+            asks_head: NONE_INDEX,
+            free_head: 0,
+            next_order_id: 1,
+            order_count: 0,
+            orders: [OrderNode::default(); MAX_ORDERS],
+        };
+
+        for i in 0..MAX_ORDERS {
+            market.orders[i].next = if i + 1 < MAX_ORDERS {
+                (i as i16) + 1
+            } else {
+                NONE_INDEX
+            };
+        }
+        market
+    }
+
+    fn simulate_place_order_state(
+        market: &mut Market,
+        user: Pubkey,
+        side: Side,
+        limit_price: u64,
+        mut quantity: u64,
+    ) -> Result<Option<u64>> {
+        let mut taker_locked_quote = 0u64;
+        let mut taker_locked_base = 0u64;
+
+        match side {
+            Side::Bid => {
+                taker_locked_quote = limit_price
+                    .checked_mul(quantity)
+                    .ok_or(error!(FusionError::MathOverflow))?;
+            }
+            Side::Ask => taker_locked_base = quantity,
+        }
+
+        while quantity > 0 {
+            let best_idx = market.best_head(side.opposite());
+            if best_idx == NONE_INDEX {
+                break;
+            }
+            let best_usize = to_usize(best_idx)?;
+            let maker = market.orders[best_usize];
+            if !maker.is_live() {
+                market.remove_from_book(best_idx)?;
+                continue;
+            }
+
+            let crosses = match side {
+                Side::Bid => maker.price <= limit_price,
+                Side::Ask => maker.price >= limit_price,
+            };
+            if !crosses {
+                break;
+            }
+
+            let trade_qty = quantity.min(maker.qty);
+            let trade_quote = trade_qty
+                .checked_mul(maker.price)
+                .ok_or(error!(FusionError::MathOverflow))?;
+
+            {
+                let maker_mut = market.order_mut(best_idx)?;
+                maker_mut.qty = maker_mut
+                    .qty
+                    .checked_sub(trade_qty)
+                    .ok_or(error!(FusionError::MathOverflow))?;
+
+                match side {
+                    Side::Bid => {
+                        maker_mut.locked_base = maker_mut
+                            .locked_base
+                            .checked_sub(trade_qty)
+                            .ok_or(error!(FusionError::MathOverflow))?;
+                        maker_mut.quote_claimable = maker_mut
+                            .quote_claimable
+                            .checked_add(trade_quote)
+                            .ok_or(error!(FusionError::MathOverflow))?;
+                        taker_locked_quote = taker_locked_quote
+                            .checked_sub(trade_quote)
+                            .ok_or(error!(FusionError::MathOverflow))?;
+                    }
+                    Side::Ask => {
+                        maker_mut.locked_quote = maker_mut
+                            .locked_quote
+                            .checked_sub(trade_quote)
+                            .ok_or(error!(FusionError::MathOverflow))?;
+                        maker_mut.base_claimable = maker_mut
+                            .base_claimable
+                            .checked_add(trade_qty)
+                            .ok_or(error!(FusionError::MathOverflow))?;
+                        taker_locked_base = taker_locked_base
+                            .checked_sub(trade_qty)
+                            .ok_or(error!(FusionError::MathOverflow))?;
+                    }
+                }
+            }
+
+            quantity = quantity
+                .checked_sub(trade_qty)
+                .ok_or(error!(FusionError::MathOverflow))?;
+
+            let now_filled = market.orders[best_usize].qty == 0;
+            if now_filled {
+                market.orders[best_usize].open = false;
+                if market.orders[best_usize].in_book {
+                    market.remove_from_book(best_idx)?;
+                }
+            }
+        }
+
+        if quantity == 0 {
+            return Ok(None);
+        }
+
+        let new_idx = market.allocate_slot()?;
+        let order_id = market.next_order_id;
+        market.next_order_id = market
+            .next_order_id
+            .checked_add(1)
+            .ok_or(error!(FusionError::MathOverflow))?;
+
+        let mut new_order = OrderNode::default();
+        new_order.used = true;
+        new_order.open = true;
+        new_order.in_book = true;
+        new_order.owner = user;
+        new_order.id = order_id;
+        new_order.side = side as u8;
+        new_order.price = limit_price;
+        new_order.qty = quantity;
+        new_order.next = NONE_INDEX;
+        new_order.prev = NONE_INDEX;
+
+        match side {
+            Side::Bid => {
+                let required = limit_price
+                    .checked_mul(quantity)
+                    .ok_or(error!(FusionError::MathOverflow))?;
+                if taker_locked_quote > required {
+                    taker_locked_quote = required;
+                }
+                new_order.locked_quote = taker_locked_quote;
+            }
+            Side::Ask => new_order.locked_base = taker_locked_base,
+        }
+
+        market.orders[to_usize(new_idx)?] = new_order;
+        market.insert_into_book(new_idx)?;
+        market.order_count = market
+            .order_count
+            .checked_add(1)
+            .ok_or(error!(FusionError::MathOverflow))?;
+
+        Ok(Some(order_id))
+    }
+
+    #[test]
+    fn partial_fill_then_resting_maker_state_is_preserved() {
+        let mut market = new_test_market();
+        let maker = Pubkey::new_unique();
+        let taker = Pubkey::new_unique();
+
+        let maker_order_id =
+            simulate_place_order_state(&mut market, maker, Side::Ask, 100, 10).unwrap().unwrap();
+        let taker_order_id =
+            simulate_place_order_state(&mut market, taker, Side::Bid, 100, 4).unwrap();
+
+        assert!(taker_order_id.is_none());
+
+        let idx = market.find_order_index(maker_order_id).unwrap();
+        let order = market.orders[to_usize(idx).unwrap()];
+        assert_eq!(order.qty, 6);
+        assert_eq!(order.locked_base, 6);
+        assert_eq!(order.quote_claimable, 400);
+        assert!(order.open);
+        assert!(order.in_book);
+    }
+
+    #[test]
+    fn full_fill_closes_maker_order() {
+        let mut market = new_test_market();
+        let maker = Pubkey::new_unique();
+        let taker = Pubkey::new_unique();
+
+        let maker_order_id =
+            simulate_place_order_state(&mut market, maker, Side::Ask, 100, 5).unwrap().unwrap();
+        let _ = simulate_place_order_state(&mut market, taker, Side::Bid, 100, 5).unwrap();
+
+        let idx = market.find_order_index(maker_order_id).unwrap();
+        let order = market.orders[to_usize(idx).unwrap()];
+        assert_eq!(order.qty, 0);
+        assert_eq!(order.locked_base, 0);
+        assert_eq!(order.quote_claimable, 500);
+        assert!(!order.open);
+        assert!(!order.in_book);
+    }
+
+    #[test]
+    fn cancel_after_partial_fill_and_claim_is_single_use() {
+        let mut market = new_test_market();
+        let maker = Pubkey::new_unique();
+        let taker = Pubkey::new_unique();
+
+        let maker_order_id =
+            simulate_place_order_state(&mut market, maker, Side::Ask, 100, 10).unwrap().unwrap();
+        let _ = simulate_place_order_state(&mut market, taker, Side::Bid, 100, 4).unwrap();
+
+        cancel_order_internal(&mut market, maker, maker_order_id).unwrap();
+        let idx = market.find_order_index(maker_order_id).unwrap();
+        let (base_out, quote_out, should_close) =
+            claim_order_proceeds_internal(&mut market, idx, maker).unwrap();
+        assert_eq!(base_out, 6);
+        assert_eq!(quote_out, 400);
+        assert!(should_close);
+
+        market.free_slot(idx).unwrap();
+        let second = market.find_order_index(maker_order_id);
+        assert!(second.is_err());
+    }
 }

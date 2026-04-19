@@ -9,6 +9,7 @@ The repo layout is now aligned with the monorepo pattern used in
 `Ellipsis-Labs/plasma`:
 - `program/` for the onchain program
 - `crates/*` for shared Rust crates
+- `docs/` for ABI and migration specs
 - `idl/` for generated interface files
 - `sdk/` for offchain clients
 - `audits/` for security artifacts
@@ -26,6 +27,7 @@ The repo layout is now aligned with the monorepo pattern used in
 ## Architecture (MVP)
 
 - Program: `program/src/lib.rs`
+- Shared primitives + canonical instruction codec: `crates/fusion_engine/src/lib.rs`
 - Market keeps a fixed-capacity order array (`MAX_ORDERS`)
 - Bids/asks are linked lists by index for deterministic ordering
 - No external crank:
@@ -37,7 +39,9 @@ The repo layout is now aligned with the monorepo pattern used in
 ```text
 .
 ├── audits/
+├── docs/
 ├── crates/
+│   ├── fusion_engine/
 │   └── fusion_state/
 ├── idl/
 ├── program/
@@ -54,6 +58,13 @@ The repo layout is now aligned with the monorepo pattern used in
 - Amounts are raw token units (no lot conversion layer yet)
 - `claim_order_proceeds` currently uses the owner signer model
 - One market account design for simple deterministic behavior
+
+## ABI freeze for wrapper swap
+
+To support the Anchor->Pinocchio wrapper migration, the current Anchor ABI
+surface is frozen in:
+
+- `docs/anchor_abi_spec.md`
 
 ## Next steps
 
