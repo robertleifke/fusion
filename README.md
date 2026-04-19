@@ -2,8 +2,8 @@
 
 Fully onchain, no-crank orderbook on Solana.
 
-This repository contains an Anchor MVP that executes matching and settlement
-inside `place_order` with no offchain keeper loops.
+This repository now uses a Pinocchio instruction wrapper with the matching and
+state engine logic extracted into shared crates.
 
 The repo layout is now aligned with the monorepo pattern used in
 `Ellipsis-Labs/plasma`:
@@ -65,6 +65,11 @@ To support the Anchor->Pinocchio wrapper migration, the current Anchor ABI
 surface is frozen in:
 
 - `docs/anchor_abi_spec.md`
+
+## Build
+
+- Program binary (Pinocchio entrypoint): `cargo build-sbf --features bpf-entrypoint`
+- Host tests: `cargo test`
 
 ## Next steps
 
