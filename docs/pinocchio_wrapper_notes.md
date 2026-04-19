@@ -41,6 +41,20 @@ Per-instruction validators now explicitly enforce:
 
 ## Current initialize behavior
 
-- The wrapper validates `market/base_vault/quote_vault` as already-created,
-  correctly-owned accounts and writes initial market state.
-- It does **not** yet recreate Anchor's implicit `init` account-creation CPIs.
+- The wrapper now recreates Anchor-like init semantics:
+  - system `create_account` CPI for `market` (PDA signer) and token vaults
+  - token `initialize_account3` CPI for vault initialization
+  - rent-based lamports/space calculation from sysvar
+  - explicit signer/writable/owner checks before CPI
+
+## Added negative-path coverage
+
+- malformed instruction data
+- unknown discriminator
+- duplicate mutable accounts
+- missing signer
+- readonly where writable is required
+- wrong token program
+- wrong vault authority PDA
+- bad market discriminator/layout bytes
+- wrong mint/token-account pairing

@@ -7,10 +7,16 @@ use fusion_engine::{
 };
 use pinocchio::{
     address::{self, Address},
+    cpi::invoke_signed,
+    sysvars::Sysvar,
     AccountView, ProgramResult,
 };
 use pinocchio_token_2022::instructions::TransferChecked;
-use solana_instruction_view::cpi::{Seed, Signer};
+use pinocchio_token_2022::instructions::InitializeAccount3;
+use solana_instruction_view::{
+    cpi::{Seed, Signer},
+    InstructionAccount, InstructionView,
+};
 use solana_program_error::ProgramError;
 
 address::declare_id!("Fus1on1111111111111111111111111111111111111");
@@ -25,9 +31,12 @@ const TOKEN_PROGRAM_LEGACY: Address =
     Address::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const TOKEN_PROGRAM_2022: Address =
     Address::from_str_const("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+const SYSTEM_PROGRAM_ID: Address =
+    Address::from_str_const("11111111111111111111111111111111");
 
 const MINT_BASE_LEN: usize = 82;
 const TOKEN_ACCOUNT_BASE_LEN: usize = 165;
+const MARKET_SPACE: usize = 8 + 256 + (MAX_ORDERS * OrderNode::SIZE);
 
 #[cfg(feature = "bpf-entrypoint")]
 pinocchio::entrypoint!(process_instruction);
@@ -131,16 +140,38 @@ fn initialize_market(accounts: &mut [AccountView], args: InitializeMarketArgs) -
     let quote_vault = &accounts[5];
     let vault_authority = &accounts[6];
     let token_program = &accounts[7];
-    let _system_program = &accounts[8];
+    let system_program = &accounts[8];
 
     require!(admin.is_signer(), FusionError::Unauthorized);
     require!(admin.is_writable(), FusionError::InvalidAccountOrder);
     require!(market_ai.is_writable(), FusionError::InvalidAccountOrder);
     require!(base_vault.is_writable(), FusionError::InvalidAccountOrder);
     require!(quote_vault.is_writable(), FusionError::InvalidAccountOrder);
+    require!(base_vault.is_signer(), FusionError::Unauthorized);
+    require!(quote_vault.is_signer(), FusionError::Unauthorized);
     ensure_unique_mutable(&[admin, market_ai, base_vault, quote_vault])?;
 
     let token_program_id = validate_token_program(token_program)?;
+    require_eq!(
+        system_program.address(),
+        &SYSTEM_PROGRAM_ID,
+        FusionError::InvalidAccountOrder
+    );
+    require_eq!(
+        market_ai.owner(),
+        &SYSTEM_PROGRAM_ID,
+        FusionError::InvalidAccountOrder
+    );
+    require_eq!(
+        base_vault.owner(),
+        &SYSTEM_PROGRAM_ID,
+        FusionError::InvalidAccountOrder
+    );
+    require_eq!(
+        quote_vault.owner(),
+        &SYSTEM_PROGRAM_ID,
+        FusionError::InvalidAccountOrder
+    );
 
     let expected_market =
         Address::derive_address(&[b"market", admin.address().as_ref()], Some(args.market_bump), &id());
@@ -164,15 +195,19 @@ fn initialize_market(accounts: &mut [AccountView], args: InitializeMarketArgs) -
         FusionError::InvalidPda
     );
 
-    validate_mint(base_mint, &token_program_id)?;
-    validate_mint(quote_mint, &token_program_id)?;
-    validate_token_account(base_vault, &token_program_id, base_mint.address(), vault_authority.address())?;
-    validate_token_account(
-        quote_vault,
-        &token_program_id,
-        quote_mint.address(),
-        vault_authority.address(),
-    )?;
+    let _ = validate_mint(base_mint, &token_program_id)?;
+    let _ = validate_mint(quote_mint, &token_program_id)?;
+
+    let rent = pinocchio::sysvars::rent::Rent::get()?;
+    let market_lamports = rent
+        .try_minimum_balance(MARKET_SPACE)
+        .map_err(|_| fusion_err(FusionError::InvalidInstructionData))?;
+    let token_lamports = rent
+        .try_minimum_balance(TOKEN_ACCOUNT_BASE_LEN)
+        .map_err(|_| fusion_err(FusionError::InvalidInstructionData))?;
+
+    let market_space = MARKET_SPACE as u64;
+    let token_space = TOKEN_ACCOUNT_BASE_LEN as u64;
 
     let mut market = Market::default();
     market.admin = addr_to_pubkey(admin.address());
@@ -199,6 +234,70 @@ fn initialize_market(accounts: &mut [AccountView], args: InitializeMarketArgs) -
             ..OrderNode::default()
         };
     }
+
+    let market_bump_seed = [args.market_bump];
+    let market_signer_seeds = [
+        Seed::from(b"market".as_slice()),
+        Seed::from(admin.address().as_ref()),
+        Seed::from(&market_bump_seed),
+    ];
+    let market_signers = [Signer::from(&market_signer_seeds)];
+
+    invoke_system_create_account(
+        system_program,
+        admin,
+        market_ai,
+        market_lamports,
+        market_space,
+        &id(),
+        &market_signers,
+    )?;
+    invoke_system_create_account(
+        system_program,
+        admin,
+        base_vault,
+        token_lamports,
+        token_space,
+        &token_program_id,
+        &[],
+    )?;
+    invoke_system_create_account(
+        system_program,
+        admin,
+        quote_vault,
+        token_lamports,
+        token_space,
+        &token_program_id,
+        &[],
+    )?;
+
+    InitializeAccount3 {
+        account: base_vault,
+        mint: base_mint,
+        owner: vault_authority.address(),
+        token_program: &token_program_id,
+    }
+    .invoke()?;
+    InitializeAccount3 {
+        account: quote_vault,
+        mint: quote_mint,
+        owner: vault_authority.address(),
+        token_program: &token_program_id,
+    }
+    .invoke()?;
+
+    validate_token_account(
+        base_vault,
+        &token_program_id,
+        base_mint.address(),
+        vault_authority.address(),
+    )?;
+    validate_token_account(
+        quote_vault,
+        &token_program_id,
+        quote_mint.address(),
+        vault_authority.address(),
+    )?;
 
     store_market(accounts, 1, &market)?;
     Ok(())
@@ -649,6 +748,35 @@ fn ensure_unique_mutable(accounts: &[&AccountView]) -> ProgramResult {
     Ok(())
 }
 
+fn invoke_system_create_account(
+    system_program: &AccountView,
+    payer: &AccountView,
+    new_account: &AccountView,
+    lamports: u64,
+    space: u64,
+    owner: &Address,
+    signers: &[Signer],
+) -> ProgramResult {
+    let instruction_accounts = [
+        InstructionAccount::writable_signer(payer.address()),
+        InstructionAccount::writable_signer(new_account.address()),
+    ];
+
+    let mut data = [0u8; 52];
+    data[0..4].copy_from_slice(&0u32.to_le_bytes());
+    data[4..12].copy_from_slice(&lamports.to_le_bytes());
+    data[12..20].copy_from_slice(&space.to_le_bytes());
+    data[20..52].copy_from_slice(owner.as_ref());
+
+    let instruction = InstructionView {
+        program_id: system_program.address(),
+        accounts: &instruction_accounts,
+        data: &data,
+    };
+
+    invoke_signed(&instruction, &[payer, new_account], signers)
+}
+
 fn validate_token_program(token_program: &AccountView) -> Result<Address> {
     let key = *token_program.address();
     if key == TOKEN_PROGRAM_LEGACY || key == TOKEN_PROGRAM_2022 {
@@ -965,6 +1093,112 @@ fn map_engine_error(err: fusion_engine::FusionEngineError) -> ProgramError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::mem::{align_of, size_of};
+    use core::ptr::{copy_nonoverlapping, write};
+    use pinocchio::account::RuntimeAccount;
+
+    struct TestAccount {
+        _backing: Vec<u8>,
+        view: AccountView,
+    }
+
+    fn new_test_account(
+        address: Address,
+        owner: Address,
+        is_signer: bool,
+        is_writable: bool,
+        executable: bool,
+        data: &[u8],
+    ) -> TestAccount {
+        let align = align_of::<RuntimeAccount>();
+        let header = size_of::<RuntimeAccount>();
+        let total = header + data.len() + align;
+        let mut backing = vec![0u8; total];
+
+        let base = backing.as_mut_ptr() as usize;
+        let aligned = (base + (align - 1)) & !(align - 1);
+        let account_ptr = aligned as *mut RuntimeAccount;
+
+        // SAFETY: `account_ptr` is aligned for `RuntimeAccount` and points inside `backing`.
+        unsafe {
+            write(
+                account_ptr,
+                RuntimeAccount {
+                    borrow_state: u8::MAX,
+                    is_signer: if is_signer { 1 } else { 0 },
+                    is_writable: if is_writable { 1 } else { 0 },
+                    executable: if executable { 1 } else { 0 },
+                    padding: [0; 4],
+                    address,
+                    owner,
+                    lamports: 0,
+                    data_len: data.len() as u64,
+                },
+            );
+
+            let data_ptr = (account_ptr as *mut u8).add(header);
+            copy_nonoverlapping(data.as_ptr(), data_ptr, data.len());
+        }
+
+        // SAFETY: `account_ptr` points to a valid `RuntimeAccount` followed by `data`.
+        let view = unsafe { AccountView::new_unchecked(account_ptr) };
+
+        TestAccount {
+            _backing: backing,
+            view,
+        }
+    }
+
+    fn initialize_ix_data(market_bump: u8, vault_bump: u8) -> Vec<u8> {
+        let mut out = Vec::with_capacity(10);
+        out.extend_from_slice(&IX_INITIALIZE_MARKET);
+        out.extend_from_slice(
+            &InitializeMarketArgs {
+                market_bump,
+                vault_authority_bump: vault_bump,
+            }
+            .try_to_vec()
+            .unwrap(),
+        );
+        out
+    }
+
+    fn cancel_ix_data(order_id: u64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(16);
+        out.extend_from_slice(&IX_CANCEL_ORDER);
+        out.extend_from_slice(&CancelOrderArgs { order_id }.try_to_vec().unwrap());
+        out
+    }
+
+    fn place_ix_data(side: u8, limit_price: u64, quantity: u64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(32);
+        out.extend_from_slice(&IX_PLACE_ORDER);
+        out.extend_from_slice(
+            &PlaceOrderArgs {
+                side,
+                limit_price,
+                quantity,
+            }
+            .try_to_vec()
+            .unwrap(),
+        );
+        out
+    }
+
+    fn mint_data(decimals: u8) -> Vec<u8> {
+        let mut data = vec![0u8; MINT_BASE_LEN];
+        data[44] = decimals;
+        data[45] = 1;
+        data
+    }
+
+    fn token_account_data(mint: Address, owner: Address) -> Vec<u8> {
+        let mut data = vec![0u8; TOKEN_ACCOUNT_BASE_LEN];
+        data[0..32].copy_from_slice(mint.as_ref());
+        data[32..64].copy_from_slice(owner.as_ref());
+        data[108] = 1; // initialized
+        data
+    }
 
     fn new_test_market() -> Market {
         let mut market = Market {
@@ -1195,5 +1429,307 @@ mod tests {
         market.free_slot(idx).unwrap();
         let second = market.find_order_index(maker_order_id);
         assert!(second.is_err());
+    }
+
+    #[test]
+    fn malformed_instruction_data_fails() {
+        let mut accounts = [];
+        let err = process_instruction(&id(), &mut accounts, &[1, 2, 3]).unwrap_err();
+        assert_eq!(err, fusion_err(FusionError::InvalidInstructionData));
+    }
+
+    #[test]
+    fn unknown_discriminator_fails() {
+        let mut accounts = [];
+        let mut data = [0u8; 8];
+        data.copy_from_slice(b"badixxxx");
+        let err = process_instruction(&id(), &mut accounts, &data).unwrap_err();
+        assert_eq!(err, ProgramError::InvalidInstructionData);
+    }
+
+    #[test]
+    fn initialize_rejects_duplicate_mutable_accounts() {
+        let admin_addr = Address::new_from_array([1u8; 32]);
+        let token_program_addr = TOKEN_PROGRAM_LEGACY;
+        let system_program_addr = SYSTEM_PROGRAM_ID;
+
+        let admin = new_test_account(
+            admin_addr,
+            system_program_addr,
+            true,
+            true,
+            false,
+            &[],
+        );
+        let market = new_test_account(
+            admin_addr, // duplicate address with admin
+            system_program_addr,
+            false,
+            true,
+            false,
+            &[],
+        );
+        let base_mint = new_test_account(Address::new_from_array([2u8; 32]), token_program_addr, false, false, false, &[]);
+        let quote_mint = new_test_account(Address::new_from_array([3u8; 32]), token_program_addr, false, false, false, &[]);
+        let base_vault = new_test_account(Address::new_from_array([4u8; 32]), system_program_addr, true, true, false, &[]);
+        let quote_vault = new_test_account(Address::new_from_array([5u8; 32]), system_program_addr, true, true, false, &[]);
+        let vault_auth = new_test_account(Address::new_from_array([6u8; 32]), system_program_addr, false, false, false, &[]);
+        let token_program = new_test_account(token_program_addr, system_program_addr, false, false, true, &[]);
+        let system_program = new_test_account(system_program_addr, system_program_addr, false, false, true, &[]);
+
+        let mut views = vec![
+            admin.view,
+            market.view,
+            base_mint.view,
+            quote_mint.view,
+            base_vault.view,
+            quote_vault.view,
+            vault_auth.view,
+            token_program.view,
+            system_program.view,
+        ];
+        let data = initialize_ix_data(1, 1);
+        let err = process_instruction(&id(), &mut views, &data).unwrap_err();
+        assert_eq!(err, fusion_err(FusionError::DuplicateMutableAccount));
+    }
+
+    #[test]
+    fn initialize_rejects_missing_admin_signer() {
+        let admin_addr = Address::new_from_array([11u8; 32]);
+        let system_program_addr = SYSTEM_PROGRAM_ID;
+        let token_program_addr = TOKEN_PROGRAM_LEGACY;
+        let market_addr = Address::derive_address(&[b"market", admin_addr.as_ref()], Some(7), &id());
+        let (vault_auth_addr, vault_bump) =
+            Address::derive_program_address(&[b"vault_auth", market_addr.as_ref()], &id()).unwrap();
+
+        let admin = new_test_account(admin_addr, system_program_addr, false, true, false, &[]);
+        let market = new_test_account(market_addr, system_program_addr, false, true, false, &[]);
+        let base_mint = new_test_account(Address::new_from_array([12u8; 32]), token_program_addr, false, false, false, &[]);
+        let quote_mint = new_test_account(Address::new_from_array([13u8; 32]), token_program_addr, false, false, false, &[]);
+        let base_vault = new_test_account(Address::new_from_array([14u8; 32]), system_program_addr, true, true, false, &[]);
+        let quote_vault = new_test_account(Address::new_from_array([15u8; 32]), system_program_addr, true, true, false, &[]);
+        let vault_auth = new_test_account(vault_auth_addr, system_program_addr, false, false, false, &[]);
+        let token_program = new_test_account(token_program_addr, system_program_addr, false, false, true, &[]);
+        let system_program = new_test_account(system_program_addr, system_program_addr, false, false, true, &[]);
+
+        let mut views = vec![
+            admin.view,
+            market.view,
+            base_mint.view,
+            quote_mint.view,
+            base_vault.view,
+            quote_vault.view,
+            vault_auth.view,
+            token_program.view,
+            system_program.view,
+        ];
+        let data = initialize_ix_data(7, vault_bump);
+        let err = process_instruction(&id(), &mut views, &data).unwrap_err();
+        assert_eq!(err, fusion_err(FusionError::Unauthorized));
+    }
+
+    #[test]
+    fn initialize_rejects_wrong_token_program() {
+        let admin_addr = Address::new_from_array([21u8; 32]);
+        let system_program_addr = SYSTEM_PROGRAM_ID;
+        let market_addr = Address::derive_address(&[b"market", admin_addr.as_ref()], Some(9), &id());
+        let (vault_auth_addr, vault_bump) =
+            Address::derive_program_address(&[b"vault_auth", market_addr.as_ref()], &id()).unwrap();
+
+        let admin = new_test_account(admin_addr, system_program_addr, true, true, false, &[]);
+        let market = new_test_account(market_addr, system_program_addr, false, true, false, &[]);
+        let base_mint = new_test_account(Address::new_from_array([22u8; 32]), SYSTEM_PROGRAM_ID, false, false, false, &[]);
+        let quote_mint = new_test_account(Address::new_from_array([23u8; 32]), SYSTEM_PROGRAM_ID, false, false, false, &[]);
+        let base_vault = new_test_account(Address::new_from_array([24u8; 32]), system_program_addr, true, true, false, &[]);
+        let quote_vault = new_test_account(Address::new_from_array([25u8; 32]), system_program_addr, true, true, false, &[]);
+        let vault_auth = new_test_account(vault_auth_addr, system_program_addr, false, false, false, &[]);
+        let token_program = new_test_account(Address::new_from_array([99u8; 32]), system_program_addr, false, false, true, &[]);
+        let system_program = new_test_account(system_program_addr, system_program_addr, false, false, true, &[]);
+
+        let mut views = vec![
+            admin.view,
+            market.view,
+            base_mint.view,
+            quote_mint.view,
+            base_vault.view,
+            quote_vault.view,
+            vault_auth.view,
+            token_program.view,
+            system_program.view,
+        ];
+        let data = initialize_ix_data(9, vault_bump);
+        let err = process_instruction(&id(), &mut views, &data).unwrap_err();
+        assert_eq!(err, ProgramError::IncorrectProgramId);
+    }
+
+    #[test]
+    fn initialize_rejects_wrong_vault_authority_pda() {
+        let admin_addr = Address::new_from_array([31u8; 32]);
+        let system_program_addr = SYSTEM_PROGRAM_ID;
+        let token_program_addr = TOKEN_PROGRAM_LEGACY;
+        let market_addr = Address::derive_address(&[b"market", admin_addr.as_ref()], Some(3), &id());
+        let (_vault_auth_addr, vault_bump) =
+            Address::derive_program_address(&[b"vault_auth", market_addr.as_ref()], &id()).unwrap();
+
+        let admin = new_test_account(admin_addr, system_program_addr, true, true, false, &[]);
+        let market = new_test_account(market_addr, system_program_addr, false, true, false, &[]);
+        let base_mint = new_test_account(Address::new_from_array([32u8; 32]), token_program_addr, false, false, false, &[]);
+        let quote_mint = new_test_account(Address::new_from_array([33u8; 32]), token_program_addr, false, false, false, &[]);
+        let base_vault = new_test_account(Address::new_from_array([34u8; 32]), system_program_addr, true, true, false, &[]);
+        let quote_vault = new_test_account(Address::new_from_array([35u8; 32]), system_program_addr, true, true, false, &[]);
+        let wrong_vault_auth = new_test_account(Address::new_from_array([36u8; 32]), system_program_addr, false, false, false, &[]);
+        let token_program = new_test_account(token_program_addr, system_program_addr, false, false, true, &[]);
+        let system_program = new_test_account(system_program_addr, system_program_addr, false, false, true, &[]);
+
+        let mut views = vec![
+            admin.view,
+            market.view,
+            base_mint.view,
+            quote_mint.view,
+            base_vault.view,
+            quote_vault.view,
+            wrong_vault_auth.view,
+            token_program.view,
+            system_program.view,
+        ];
+        let data = initialize_ix_data(3, vault_bump);
+        let err = process_instruction(&id(), &mut views, &data).unwrap_err();
+        assert_eq!(err, fusion_err(FusionError::InvalidPda));
+    }
+
+    #[test]
+    fn cancel_rejects_missing_signer() {
+        let owner_addr = Address::new_from_array([41u8; 32]);
+        let owner = new_test_account(owner_addr, SYSTEM_PROGRAM_ID, false, false, false, &[]);
+        let market = new_test_account(
+            Address::new_from_array([42u8; 32]),
+            id(),
+            false,
+            true,
+            false,
+            &[0u8; 64],
+        );
+
+        let mut views = vec![owner.view, market.view];
+        let err = process_instruction(&id(), &mut views, &cancel_ix_data(1)).unwrap_err();
+        assert_eq!(err, fusion_err(FusionError::Unauthorized));
+    }
+
+    #[test]
+    fn cancel_rejects_readonly_market() {
+        let owner_addr = Address::new_from_array([51u8; 32]);
+        let owner = new_test_account(owner_addr, SYSTEM_PROGRAM_ID, true, false, false, &[]);
+        let market = new_test_account(
+            Address::new_from_array([52u8; 32]),
+            id(),
+            false,
+            false,
+            false,
+            &[0u8; 64],
+        );
+
+        let mut views = vec![owner.view, market.view];
+        let err = process_instruction(&id(), &mut views, &cancel_ix_data(1)).unwrap_err();
+        assert_eq!(err, fusion_err(FusionError::InvalidAccountOrder));
+    }
+
+    #[test]
+    fn cancel_rejects_bad_market_discriminator() {
+        let owner_addr = Address::new_from_array([61u8; 32]);
+        let owner = new_test_account(owner_addr, SYSTEM_PROGRAM_ID, true, false, false, &[]);
+        let market = new_test_account(
+            Address::new_from_array([62u8; 32]),
+            id(),
+            false,
+            true,
+            false,
+            &[0u8; 64],
+        );
+
+        let mut views = vec![owner.view, market.view];
+        let err = process_instruction(&id(), &mut views, &cancel_ix_data(1)).unwrap_err();
+        assert_eq!(err, fusion_err(FusionError::InvalidAccountOrder));
+    }
+
+    #[test]
+    fn place_order_rejects_wrong_mint_token_account_pairing() {
+        let token_program_addr = TOKEN_PROGRAM_LEGACY;
+        let user_addr = Address::new_from_array([71u8; 32]);
+        let market_addr = Address::new_from_array([72u8; 32]);
+        let base_mint_addr = Address::new_from_array([73u8; 32]);
+        let quote_mint_addr = Address::new_from_array([74u8; 32]);
+        let base_vault_addr = Address::new_from_array([75u8; 32]);
+        let quote_vault_addr = Address::new_from_array([76u8; 32]);
+        let user_base_ata_addr = Address::new_from_array([77u8; 32]);
+        let user_quote_ata_addr = Address::new_from_array([78u8; 32]);
+        let (vault_auth_addr, vault_bump) =
+            Address::derive_program_address(&[b"vault_auth", market_addr.as_ref()], &id()).unwrap();
+
+        let mut market_state = Market::default();
+        market_state.base_mint = addr_to_pubkey(&base_mint_addr);
+        market_state.quote_mint = addr_to_pubkey(&quote_mint_addr);
+        market_state.base_vault = addr_to_pubkey(&base_vault_addr);
+        market_state.quote_vault = addr_to_pubkey(&quote_vault_addr);
+        market_state.vault_authority_bump = vault_bump;
+        market_state.free_head = NONE_INDEX;
+        let mut market_bytes = vec![];
+        market_bytes.extend_from_slice(&MARKET_DISCRIMINATOR);
+        market_bytes.extend_from_slice(&market_state.try_to_vec().unwrap());
+
+        let user = new_test_account(user_addr, SYSTEM_PROGRAM_ID, true, true, false, &[]);
+        let market = new_test_account(market_addr, id(), false, true, false, &market_bytes);
+        let base_mint = new_test_account(base_mint_addr, token_program_addr, false, false, false, &mint_data(6));
+        let quote_mint = new_test_account(quote_mint_addr, token_program_addr, false, false, false, &mint_data(6));
+        let base_vault = new_test_account(
+            base_vault_addr,
+            token_program_addr,
+            false,
+            true,
+            false,
+            &token_account_data(base_mint_addr, vault_auth_addr),
+        );
+        let quote_vault = new_test_account(
+            quote_vault_addr,
+            token_program_addr,
+            false,
+            true,
+            false,
+            &token_account_data(quote_mint_addr, vault_auth_addr),
+        );
+        let user_base_ata = new_test_account(
+            user_base_ata_addr,
+            token_program_addr,
+            false,
+            true,
+            false,
+            &token_account_data(base_mint_addr, user_addr),
+        );
+        let user_quote_ata = new_test_account(
+            user_quote_ata_addr,
+            token_program_addr,
+            false,
+            true,
+            false,
+            &token_account_data(base_mint_addr, user_addr), // intentionally wrong mint
+        );
+        let vault_auth = new_test_account(vault_auth_addr, SYSTEM_PROGRAM_ID, false, false, false, &[]);
+        let token_program =
+            new_test_account(token_program_addr, SYSTEM_PROGRAM_ID, false, false, true, &[]);
+
+        let mut views = vec![
+            user.view,
+            market.view,
+            base_mint.view,
+            quote_mint.view,
+            base_vault.view,
+            quote_vault.view,
+            user_base_ata.view,
+            user_quote_ata.view,
+            vault_auth.view,
+            token_program.view,
+        ];
+        let err = process_instruction(&id(), &mut views, &place_ix_data(Side::Bid as u8, 1, 1))
+            .unwrap_err();
+        assert_eq!(err, fusion_err(FusionError::InvalidAccountOrder));
     }
 }
